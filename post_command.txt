@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Set variables for input/output files and API URL
+image_path="/home/network/Documents/Semantic Communications/test_image.png"
+output_image_path="/home/network/Documents/Semantic Communications/output_image.png"
+api_url="http://localhost:4040/process_image"
+
+# Encode image to base64 (no line breaks)
+image_base64=$(base64 -w 0 "$image_path")
+
+# Create JSON payload with noise_level and image data
+json_payload=$(jq -n --arg image "$image_base64" --argjson \
+  '{image: $image}')
+
+# Make POST request and capture response
+response=$(curl -s -X POST "$api_url" \
+  -H "Content-Type: application/json" \
+  -d "$json_payload")
+
+# Extract the 'reconstructed_image' field from response using jq
+reconstructed_image=$(echo "$response" | jq -r '.reconstructed_image // empty')
+
+if [ -n "$reconstructed_image" ]; then
+  # Decode the base64 string and save the output image
+  echo "$reconstructed_image" | base64 -d > "$output_image_path"
+  echo "Reconstructed image saved to $output_image_path"
+else
+  echo "Error: No reconstructed image in the response."
+fi
+

@@ -1,0 +1,85 @@
+INFO:     Uvicorn running on http://0.0.0.0:4040 (Press CTRL+C to quit)
+Reconstruct Noise...
+0.02734375
+0.01807737594500594
+INFO:     127.0.0.1:38660 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.00946384924611247
+INFO:     127.0.0.1:64244 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.01800007608745848
+INFO:     127.0.0.1:64248 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.013855143722660918
+INFO:     127.0.0.1:64256 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.01597743649521651
+INFO:     127.0.0.1:64266 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.0060208768588524385
+INFO:     127.0.0.1:64276 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.00495937628320749
+INFO:     127.0.0.1:55224 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.02266047334436686
+INFO:     127.0.0.1:55232 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+[2025-09-11 20:31:44,423] torch._dynamo.convert_frame: [WARNING] torch._dynamo hit config.cache_size_limit (8)
+[2025-09-11 20:31:44,423] torch._dynamo.convert_frame: [WARNING]    function: 'resume_in_apply_latent_awgn_noise' (/home/network/Documents/Semantic Communications/semacomm-master/flowmo/models.py:439)
+[2025-09-11 20:31:44,423] torch._dynamo.convert_frame: [WARNING]    last reason: L['___stack0'] == 0.6611154631316458                          # noise_level = random.random() * torch.mean(code).item()  # ome/network/Documents/Semantic Communications/semacomm-master/flowmo/models.py:439 in resume_in_apply_latent_awgn_noise
+[2025-09-11 20:31:44,423] torch._dynamo.convert_frame: [WARNING] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[2025-09-11 20:31:44,423] torch._dynamo.convert_frame: [WARNING] To diagnose recompilation issues, see https://pytorch.org/docs/master/compile/troubleshooting.html.
+0.02163589765682492
+INFO:     127.0.0.1:55246 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.025664113697050822
+INFO:     127.0.0.1:55252 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.009509787106365075
+INFO:     127.0.0.1:55258 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.012166822320221754
+INFO:     127.0.0.1:55266 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.01484438380997597
+INFO:     127.0.0.1:55282 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.00768462529872075
+INFO:     127.0.0.1:49512 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.015102969865385184
+INFO:     127.0.0.1:49526 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.01354954908329837
+INFO:     127.0.0.1:49536 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.021442286403471286
+INFO:     127.0.0.1:49542 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.011075046148984486
+INFO:     127.0.0.1:49550 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.026395518177348233
+INFO:     127.0.0.1:49558 - "POST /process_image HTTP/1.1" 200 OK
+Reconstruct Noise...
+0.02734375
+0.019556702782624565
