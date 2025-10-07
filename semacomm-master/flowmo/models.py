@@ -23,8 +23,6 @@ import os
 import csv
 import logging
 
-
-
 MUP_ENABLED = True
 
 import torch._dynamo
@@ -35,42 +33,77 @@ logging.getLogger("torch._guards").setLevel(logging.ERROR)
 
 import torch.nn as nn
 
-class ErrorCorrector(nn.Module):
-    def __init__(self, input_dim=576, hidden_dim=512, output_dim=576):
+
+# New transformer-based error corrector matching the training code.
+class AWGNErrorCorrector(nn.Module):
+    def __init__(self, input_dim=288, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Sigmoid()
+        # Project input packed-code vector to model dimension
+        self.input_fc = nn.Linear(input_dim, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
         )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(self, x):
-        return self.net(x)
+        # Output: predict input_dim numbers per position (reconstruct packed codes)
+        self.output_fc = nn.Linear(d_model, input_dim)
 
-# ERROR_CORRECTOR_PATH = "../.././error_correction/error_corrector_updated_dataset.pth"
-ERROR_CORRECTOR_PATH = "/home/network/Documents/Semantic Communications/error_correction/error_corrector_updated_dataset.pth"
+    def forward(self, x: Tensor) -> Tensor:
+        # x expected shape: [B, seq_len, input_dim] where input_dim==288
+        x = self.input_fc(x)
+        x = self.transformer_encoder(x)
+        x = self.output_fc(x)
+        return x
 
-def load_error_corrector():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# # Path to the saved transformer-based error corrector.
+# # Keep existing absolute path but allow an environment override.
+# ERROR_CORRECTOR_PATH = os.environ.get(
+#     "ERROR_CORRECTOR_PATH",
+#     "/home/network/Documents/Semantic Communications/error_correction/error_corrector_updated_dataset.pth",
+# )
+ERROR_CORRECTOR_PATH = "/home/network/Documents/Semantic Communications/error_correction/code_awgn_error_corrector.pth"
+
+def load_error_corrector(device: torch.device | None = None) -> nn.Module:
+    """Load the transformer-based error corrector.
+
+    The checkpoint is expected to contain the state_dict for an
+    AWGNErrorCorrector trained to reconstruct packed-code vectors of
+    dimension 288 per position. The returned model is moved to `device`
+    and set to eval() mode.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[INFO] Loading Error Corrector model from {ERROR_CORRECTOR_PATH}")
-    
-    # 1. Create model instance
-    model = ErrorCorrector(input_dim=576, hidden_dim=512, output_dim=576)
-    
-    # 2. Load state_dict
-    state_dict = torch.load(ERROR_CORRECTOR_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    
-    # 3. Eval mode
+
+    # create model instance matching training architecture
+    model = AWGNErrorCorrector(input_dim=288, d_model=256, nhead=8, num_layers=6)
+
+    if not os.path.isfile(ERROR_CORRECTOR_PATH):
+        raise FileNotFoundError(f"Error corrector checkpoint not found: {ERROR_CORRECTOR_PATH}")
+
+    state = torch.load(ERROR_CORRECTOR_PATH, map_location=device)
+
+    # handle cases where a dict contains other keys like {'model_state_dict': ...}
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if isinstance(state, dict) and next(iter(state)).startswith("module"):
+        # try to strip a leading 'module.' if present
+        new_state = {k.replace("module.", ""): v for k, v in state.items()}
+        state = new_state
+
+    model.load_state_dict(state)
     model.to(device)
     model.eval()
     return model
  
-def predict_bytestream(bytestream: bytes, model=None, device=None) -> bytes:
+def predict_bytestream(bytestream: bytes, model: nn.Module | None = None, device: torch.device | None = None) -> bytes:
     """
     Corrects a corrupted bytestream using the trained error_corrector model.
 
@@ -86,33 +119,41 @@ def predict_bytestream(bytestream: bytes, model=None, device=None) -> bytes:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if model is None:
-        model = load_error_corrector()
-        if model is None:
-            raise RuntimeError("Error corrector model not found.")
+        model = load_error_corrector(device)
+
 
     # Convert input bytes -> numpy -> tensor
 
-    buffer_array = np.frombuffer(bytestream, dtype=np.uint8)
-    print("Buffer array shape:", buffer_array.shape, buffer_array.dtype)
+    # interpret incoming bytestream as packed-code uint8s per position
+    # Expected shapes:
+    #  - single vector: length == 288 -> returns reconstructed 288 bytes
+    #  - sequence: length % 288 == 0 -> reshaped to (seq_len, 288) and returned
+    buf = np.frombuffer(bytestream, dtype=np.uint8)
+    # Expect packed representation of shape (seq_len * code_dim) or (seq_len, input_dim)
+    # Here dataset uses input_dim=288 per position. We'll try to reshape accordingly.
+    if buf.size == 288:
+        # single position vector
+        arr = buf.astype(np.float32) / 255.0
+        arr = arr.reshape(1, 1, 288)  # [B=1, seq_len=1, input_dim=288]
+    elif buf.size == 288 * 1:
+        arr = buf.astype(np.float32) / 255.0
+        arr = arr.reshape(1, 1, 288)
+    elif buf.size % 288 == 0:
+        seq_len = buf.size // 288
+        arr = buf.astype(np.float32).reshape(seq_len, 288) / 255.0
+        arr = arr.reshape(1, seq_len, 288)
+    else:
+        raise ValueError(f"Input bytestream length {buf.size} is not compatible with input_dim=288")
 
-    writable_array = np.copy(buffer_array)  # Ensure the array is writeable
-    print("Writable array shape:", writable_array.shape, writable_array.dtype)
-    
-    arr = writable_array.astype(np.float32) / 255.0
-    print("Input array shape:", arr.shape, arr.dtype)
-
-    tensor_in = torch.tensor(arr, dtype=torch.float32, device=device).unsqueeze(0).float()  # (1, 576)
-    print("Input tensor shape:", tensor_in.shape, tensor_in.dtype, tensor_in.device)
+    tensor_in = torch.tensor(arr, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         out = model(tensor_in)
-    print("Output tensor shape:", out.shape, out.dtype, out.device)
-    
-    out_arr = (out.squeeze(0).float().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
-    print("Output array shape:", out_arr.shape, out_arr.dtype)
-    
-    corrected_bytestream = out_arr.tobytes()
-    return corrected_bytestream
+
+    out_np = out.squeeze(0).cpu().numpy()  # [seq_len, 288]
+    # convert back to uint8 packed representation
+    out_flat = (out_np.reshape(-1) * 255.0).round().clip(0, 255).astype(np.uint8)
+    return out_flat.tobytes()
 
 error_corrector = load_error_corrector()
 
@@ -680,6 +721,94 @@ def corrupt_bytestream(bytestream: bytes, bit_error_rate: float = random.random(
 
     return bytes(byte_array)
 
+def corrupt_bytestream_awgn(bytestream: bytes, psnr: float) -> bytes:
+    """
+    Corrupt a bytestream using AWGN, with proper BPSK modulation and PSNR control.
+
+    Args:
+        bytestream (bytes): Input bytestream.
+        psnr (float): Target PSNR in dB (higher = less noise).
+
+    Returns:
+        bytes: Corrupted bytestream.
+    """
+    if psnr <= 0:
+        raise ValueError("PSNR must be > 0")
+
+    # Convert to bit array
+    arr = np.frombuffer(bytestream, dtype=np.uint8)
+    bits = np.unpackbits(arr)
+
+    # Map bits {0,1} -> BPSK symbols {-1,+1}
+    symbols = 2 * bits.astype(np.float32) - 1.0
+
+    # Signal power
+    signal_power = np.mean(symbols ** 2)  # should be ~1.0 for BPSK
+
+    # Noise variance from PSNR
+    noise_variance = signal_power / (10 ** (psnr / 10))
+    noise_std = np.sqrt(noise_variance)
+
+    # Add Gaussian noise
+    noisy_symbols = symbols + np.random.normal(0, noise_std, size=symbols.shape)
+
+    # Hard decision back to bits
+    noisy_bits = (noisy_symbols > 0).astype(np.uint8)
+
+    # Pack bits back into bytes
+    noisy_arr = np.packbits(noisy_bits)
+
+    return noisy_arr.tobytes()
+
+
+def add_awgn_to_bytestream(bytestream, snr_db):
+    """
+    Adds Additive White Gaussian Noise (AWGN) to a bytestream.
+    
+    Args:
+        bytestream (bytes): The input bytestream.
+        snr_db (float): The desired Signal-to-Noise Ratio in decibels (dB).
+        
+    Returns:
+        bytes: The output bytestream with added AWGN.
+    """
+    # 1. Convert bytestream to a numerical NumPy array
+    # We use uint8 and normalize to a float range, e.g., [-1, 1] or [0, 1]
+    signal_array = np.frombuffer(bytestream, dtype=np.uint8).astype(np.float64)
+    
+    # Normalize the signal to the range [-1, 1] for a cleaner power calculation
+    signal_normalized = (signal_array / 127.5) - 1.0
+    
+    # 2. Calculate the signal power
+    # Signal power is the mean of the squared signal values
+    signal_power = np.mean(signal_normalized**2)
+    
+    # 3. Convert SNR from dB to a linear scale
+    snr_linear = 10**(snr_db / 10.0)
+    
+    # Calculate the noise power
+    # SNR_linear = Signal_Power / Noise_Power -> Noise_Power = Signal_Power / SNR_linear
+    if snr_linear <= 0:
+        raise ValueError("SNR must be greater than 0")
+    noise_power = signal_power / snr_linear
+    
+    # Calculate the noise standard deviation
+    noise_std = np.sqrt(noise_power)
+    
+    # 4. Generate AWGN with the calculated standard deviation
+    noise = noise_std * np.random.randn(len(signal_normalized))
+    
+    # 5. Add the noise to the normalized signal
+    noisy_signal_normalized = signal_normalized + noise
+    
+    # 6. Convert the noisy signal back to bytes
+    # Scale and clamp the values to the original uint8 range [0, 255]
+    noisy_signal_array = ((noisy_signal_normalized + 1.0) * 127.5)
+    noisy_signal_array = np.clip(noisy_signal_array, 0, 255).astype(np.uint8)
+    
+    return noisy_signal_array.tobytes()
+
+
 def build_and_save_dataset(bytestream, n_samples=10, 
                            ber_pools=[0.0, 0.2, 0.5, 1.0], 
                            save_path="./error_correction/dataset.csv"):
@@ -702,6 +831,65 @@ def build_and_save_dataset(bytestream, n_samples=10,
                 writer.writerow(row)
 
     print(f"Dataset saved to {save_path}, total rows={n_samples * len(ber_pools)}")
+
+def build_and_save_dataset_awgn(bytestream, n_samples=10, 
+                           psnr_pools=[1, 5, 10, 20, 50], 
+                           save_path="./error_correction/awgn_dataset.csv"):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    byte_len = len(bytestream)
+
+    with open(save_path, "a+", newline="") as f:
+        writer = csv.writer(f)
+
+        # header: Noise + Original bytes + Corrupted bytes
+        # header = ["PSNR"] + [f"Original_{i}" for i in range(byte_len)] + [f"Corrupted_{i}" for i in range(byte_len)]
+        # writer.writerow(header)
+
+        for _ in range(n_samples):
+            original = list(bytestream)
+            for psnr in psnr_pools:
+                corrupted = list(corrupt_bytestream_awgn(bytestream, psnr))
+                row = [psnr] + original + corrupted
+                writer.writerow(row)
+
+    print(f"Dataset saved to {save_path}, total rows={n_samples * len(psnr_pools)}")
+
+def create_dataset_awgn(bytestream, n_samples=10, 
+                           snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
+                           save_path="./error_correction/code_awgn_dataset.csv", shape = [-1, -1, -1]):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    original_code = unpack_bytestream(bytestream)
+    # original_code = unpack_bits(original_code, original_shape=shape)
+    # final_code = unpack_bits(original_code, original_shape=shape)   
+    # print(final_code)
+    if isinstance(original_code, torch.Tensor):
+        original_code = original_code.detach().cpu().numpy().flatten()
+    else:
+        original_code = list(original_code)
+    code_len = len(original_code)
+
+    with open(save_path, "a+", newline="") as f:
+        writer = csv.writer(f)
+
+        # header: Noise + Original bytes + Corrupted bytes
+        # header = ["SNR_DB"] + [f"Original_{i}" for i in range(code_len)] + [f"Corrupted_{i}" for i in range(code_len)]
+        # writer.writerow(header)
+
+        for _ in range(n_samples):
+            original = list(bytestream)
+            for snr_db in snr_db_pools:
+                corrupted = add_awgn_to_bytestream(bytestream, snr_db)
+                corrupted_code = unpack_bytestream(corrupted)
+
+                if isinstance(corrupted_code, torch.Tensor):
+                    corrupted_code = corrupted_code.detach().cpu().numpy().flatten()
+                else:
+                    corrupted_code = list(corrupted_code)
+
+                row = [snr_db] + list(original_code) + list(corrupted_code)
+                writer.writerow(row)
 
 class Flux(nn.Module):
     """
@@ -980,32 +1168,126 @@ class FlowMo(nn.Module):
         code = pack_bits(code)
         print("Packed:", code.shape, code.dtype)
 
+        orginal_code = code
+
         # Convert to bytestream
         bytestream = pack_bytestream(code)
         print("Bytestream length:", len(bytestream))
 
         # Corrupt bytestream
-        corrupted_bytestream = corrupt_bytestream(bytestream, bit_error_rate=0.2)
+        # corrupted_bytestream = corrupt_bytestream(bytestream, bit_error_rate=0.1)
+        # corrupt_bytestream = bytestream
+        # ratio = random.random()   # PSNR between 0 and 20 dB
+        # corrupted_bytestream = corrupt_bytestream_awgn(bytestream, ratio)
+        # print("Ratio:", ratio)
 
-        print("Corrupted bytestream length:", len(corrupted_bytestream))
+        # build_and_save_dataset_awgn(bytestream, n_samples=5, 
+        #                            psnr_pools=[0.025, 0.1, 1, 2, 5, 50], 
+        #                            save_path="./error_correction/awgn_dataset.csv")
+        # print("Corrupted bytestream length:", len(corrupted_bytestream))
 
         # Recover bytestream
-        bytestream = predict_bytestream(corrupted_bytestream)
-        bytestream = corrupted_bytestream
+        # bytestream = predict_bytestream(corrupted_bytestream)
+        # bytestream = corrupted_bytestream
 
         # build_and_save_dataset(bytestream, n_samples=5, 
         #                        ber_pools=[0.0, 0.2, 0.5, 0.8], 
         #                        save_path="./error_correction/dataset.csv")
 
+
         # raise RuntimeError("Stop here for dataset generation")
-        print("Recovered bytestream length:", len(bytestream))
+        # print("Recovered bytestream length:", len(bytestream))
+
+        
+        # create_dataset_awgn(bytestream, n_samples=5, 
+        #                            snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
+        #                            save_path="./error_correction/code_awgn_dataset.csv", shape = [b, t, f])
+    
+        # raise RuntimeError("Stop here for dataset generation")
+
+        corrupted_bytestream = add_awgn_to_bytestream(bytestream, snr_db=500)
+        print("Bytestream length after AWGN:", len(bytestream))
 
         # Unpack bytestream
-        code = unpack_bytestream(bytestream)
+        corrupted_code = unpack_bytestream(corrupted_bytestream)
         print("Unpacked from bytes:", code.shape, code.dtype)
 
-        # Unpack
-        code = unpack_bits(code, [b, t, f])
+        try:
+            # corrupted_code is a torch tensor of dtype int16 representing packed words
+            device_pred = None
+            if 'error_corrector' in globals() and error_corrector is not None:
+                # model device
+                try:
+                    device_pred = next(error_corrector.parameters()).device
+                except Exception:
+                    device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # Move corrupted_code to cpu numpy for normalization
+            if isinstance(corrupted_code, torch.Tensor):
+                # ensure conversion to a numpy-friendly dtype
+                corrupted_np = corrupted_code.detach().cpu().to(torch.float32).numpy().astype(np.float32)
+            else:
+                corrupted_np = np.array(corrupted_code, dtype=np.float32)
+
+            # Normalization parameters (matches notebook dataset preprocessing)
+            min_val = -32768.0
+            max_val = 32767.0
+
+            # Normalize to [0,1]
+            norm = (corrupted_np - min_val) / (max_val - min_val)
+
+            # Try to reshape into a [B, seq_len, 288] input for the transformer
+            total = norm.size
+            reshaped = None
+            if total == (b * t * 288):
+                reshaped = norm.reshape(b, t, 288)
+            elif total % 288 == 0:
+                seq_len = total // 288
+                reshaped = norm.reshape(1, seq_len, 288)
+            else:
+                # fallback: reshape to [b, t, f] if shapes match
+                if total == (b * t * f):
+                    reshaped = norm.reshape(b, t, f)
+                else:
+                    # As last resort, flatten to single sequence of length 288 chunks
+                    seq_len = max(1, total // 288)
+                    trimmed = norm[: seq_len * 288]
+                    reshaped = trimmed.reshape(1, seq_len, 288)
+
+            tensor_in = torch.tensor(reshaped, dtype=torch.float32, device=device_pred)
+
+            with torch.no_grad():
+                pred_out = error_corrector(tensor_in)
+
+            # ensure predicted tensor is float32 on cpu before converting to numpy
+            pred_np = pred_out.cpu().to(torch.float32).numpy().reshape(-1)[: total]
+
+            # Denormalize back to int16 range
+            denorm = np.round(pred_np * (max_val - min_val) + min_val).astype(np.int16)
+
+            # Ensure same length as corrupted_np; if we trimmed earlier, pad/trim
+            if denorm.size != corrupted_np.size:
+                denorm = np.resize(denorm, corrupted_np.shape)
+
+            # Write back into corrupted_code as torch tensor of dtype int16 on original device
+            corrupted_code = torch.from_numpy(denorm).to(code.device)
+        except Exception as e:
+            # If prediction fails, fall back to using the noisy corrupted_code
+            print("Error during error-corrector prediction:", e)
+            # keep corrupted_code as-is
+
+        # Unpack to restore shape [b, t, f]
+        restored = unpack_bits(corrupted_code, [b, t, f])
+        # ensure dtype/device match original quantized tensor
+        try:
+            restored = restored.to(quantized_code.dtype).to(quantized_code.device)
+        except Exception:
+            restored = restored.to(quantized_code.device)
+
+        # assign back to `code` so callers receive the restored [b,t,f] tensor
+        code = restored
         print("Restored equals original?", torch.equal(code, quantized_code))
 
         # code = code.to(torch.bfloat16)
