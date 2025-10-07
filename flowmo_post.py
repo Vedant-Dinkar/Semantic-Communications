@@ -2,7 +2,7 @@ import base64
 import requests
 
 # 1. Read image from disk and convert to base64 string
-imagepath = "/home/network/Documents/Semantic Communications/test_image (5).png"
+imagepath = "/home/network/Documents/Semantic Communications/test_image (7).png"
 with open(imagepath, "rb") as img_file:
     imagebase64 = base64.b64encode(img_file.read()).decode('utf-8')
 
