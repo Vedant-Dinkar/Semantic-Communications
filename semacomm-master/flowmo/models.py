@@ -34,31 +34,41 @@ logging.getLogger("torch._guards").setLevel(logging.ERROR)
 import torch.nn as nn
 
 
-# New transformer-based error corrector matching the training code.
-class AWGNErrorCorrector(nn.Module):
-    def __init__(self, input_dim=288, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1):
+# New transformer-based error corrector for binary data.
+class AWGNErrorCorrectorBinary(nn.Module):
+    def __init__(self, input_dim=4608, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1):
         super().__init__()
-        # Project input packed-code vector to model dimension
         self.input_fc = nn.Linear(input_dim, d_model)
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            activation="gelu",
+            activation="gelu"
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output: predict input_dim numbers per position (reconstruct packed codes)
-        self.output_fc = nn.Linear(d_model, input_dim)
+        # Multi-layer MLP head
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 1024),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, input_dim),
+            nn.Sigmoid()  # binary output in [0, 1]
+        )
 
-    def forward(self, x: Tensor) -> Tensor:
-        # x expected shape: [B, seq_len, input_dim] where input_dim==288
+    def forward(self, x):
+        # x in range [-1, 1], convert to [0,1] for BCE compatibility
+        x = (x + 1) / 2
         x = self.input_fc(x)
         x = self.transformer_encoder(x)
-        x = self.output_fc(x)
+        x = self.mlp(x)
+        # Convert output back to [-1,1]
+        x = (x * 2) - 1
         return x
 
 # # Path to the saved transformer-based error corrector.
@@ -67,14 +77,14 @@ class AWGNErrorCorrector(nn.Module):
 #     "ERROR_CORRECTOR_PATH",
 #     "/home/network/Documents/Semantic Communications/error_correction/error_corrector_updated_dataset.pth",
 # )
-ERROR_CORRECTOR_PATH = "/home/network/Documents/Semantic Communications/error_correction/code_awgn_error_corrector.pth"
+ERROR_CORRECTOR_PATH = "/home/network/Documents/Semantic Communications/error_correction/binary_awgn_error_corrector.pth"
 
 def load_error_corrector(device: torch.device | None = None) -> nn.Module:
     """Load the transformer-based error corrector.
 
     The checkpoint is expected to contain the state_dict for an
-    AWGNErrorCorrector trained to reconstruct packed-code vectors of
-    dimension 288 per position. The returned model is moved to `device`
+    AWGNErrorCorrectorBinary trained to reconstruct binary vectors of
+    dimension 4608 per position. The returned model is moved to `device`
     and set to eval() mode.
     """
     if device is None:
@@ -83,7 +93,7 @@ def load_error_corrector(device: torch.device | None = None) -> nn.Module:
     print(f"[INFO] Loading Error Corrector model from {ERROR_CORRECTOR_PATH}")
 
     # create model instance matching training architecture
-    model = AWGNErrorCorrector(input_dim=288, d_model=256, nhead=8, num_layers=6)
+    model = AWGNErrorCorrectorBinary(input_dim=4608, d_model=256, nhead=8, num_layers=6)
 
     if not os.path.isfile(ERROR_CORRECTOR_PATH):
         raise FileNotFoundError(f"Error corrector checkpoint not found: {ERROR_CORRECTOR_PATH}")
@@ -855,9 +865,65 @@ def build_and_save_dataset_awgn(bytestream, n_samples=10,
 
     print(f"Dataset saved to {save_path}, total rows={n_samples * len(psnr_pools)}")
 
+def create_dataset_awgn_binary(
+    bytestream,
+    n_samples=10, 
+    snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
+    save_path="./error_correction/binary_code_awgn_dataset.csv", 
+    shape=[1, 256, 18]
+):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    print("Creating dataset with shape:", shape)
+
+    # --- Step 1: Unpack clean bytestream ---
+    original_code = unpack_bytestream(bytestream)
+    print("Original code length:", len(original_code))
+
+    # --- Step 2: Unpack bits to binary (-1/+1) representation ---
+    original_code = unpack_bits(original_code, original_shape=shape)
+    print("Unpacked code shape:", original_code.shape)
+
+    # --- Step 3: Ensure supported dtype ---
+    if isinstance(original_code, torch.Tensor):
+        # Force cast from bfloat16 → float32 before numpy conversion
+        original_code = original_code.to(torch.float32).detach().cpu().numpy().flatten()
+    else:
+        original_code = np.array(original_code, dtype=np.float32).flatten()
+
+    code_len = len(original_code)
+    print("Code length before write:", code_len)
+
+    # --- Step 4: Open CSV file ---
+    with open(save_path, "a+", newline="") as f:
+        writer = csv.writer(f)
+
+        # Write header once
+        if f.tell() == 0:
+            header = ["SNR_DB"] + [f"Original_{i}" for i in range(code_len)] + [f"Corrupted_{i}" for i in range(code_len)]
+            writer.writerow(header)
+
+        # --- Step 5: Generate noisy samples ---
+        for _ in range(n_samples):
+            for snr_db in snr_db_pools:
+                corrupted = add_awgn_to_bytestream(bytestream, snr_db)
+                corrupted_code = unpack_bytestream(corrupted)
+                corrupted_code = unpack_bits(corrupted_code, original_shape=shape)
+
+                if isinstance(corrupted_code, torch.Tensor):
+                    corrupted_code = corrupted_code.to(torch.float32).detach().cpu().numpy().flatten()
+                else:
+                    corrupted_code = np.array(corrupted_code, dtype=np.float32).flatten()
+
+                row = [snr_db] + original_code.tolist() + corrupted_code.tolist()
+                writer.writerow(row)
+
+                print(f"[SNR={snr_db}] Row written successfully with {code_len} elements.")
+
+
 def create_dataset_awgn(bytestream, n_samples=10, 
-                           snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
-                           save_path="./error_correction/code_awgn_dataset.csv", shape = [-1, -1, -1]):
+            snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
+            save_path="./error_correction/code_awgn_dataset.csv", shape = [-1, -1, -1]):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     original_code = unpack_bytestream(bytestream)
@@ -1164,11 +1230,11 @@ class FlowMo(nn.Module):
         print("Before and after noise for shape: ", code.shape)
         print("Original:", code.shape)
 
+        original_code = code
+
         # Pack
         code = pack_bits(code)
         print("Packed:", code.shape, code.dtype)
-
-        orginal_code = code
 
         # Convert to bytestream
         bytestream = pack_bytestream(code)
@@ -1203,92 +1269,174 @@ class FlowMo(nn.Module):
         #                            snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
         #                            save_path="./error_correction/code_awgn_dataset.csv", shape = [b, t, f])
     
+        # create_dataset_awgn_binary(bytestream, n_samples=5, 
+        #                          snr_db_pools=[5, 10, 20, 50, 100, 500, 1000], 
+        #                          save_path="./error_correction/binary_code_awgn_dataset.csv", shape = [b, t, f])
+    
         # raise RuntimeError("Stop here for dataset generation")
 
-        corrupted_bytestream = add_awgn_to_bytestream(bytestream, snr_db=500)
+        corrupted_bytestream = add_awgn_to_bytestream(bytestream, snr_db=200)
         print("Bytestream length after AWGN:", len(bytestream))
 
         # Unpack bytestream
         corrupted_code = unpack_bytestream(corrupted_bytestream)
         print("Unpacked from bytes:", code.shape, code.dtype)
 
-        try:
-            # corrupted_code is a torch tensor of dtype int16 representing packed words
-            device_pred = None
-            if 'error_corrector' in globals() and error_corrector is not None:
-                # model device
-                try:
-                    device_pred = next(error_corrector.parameters()).device
-                except Exception:
-                    device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            else:
-                device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # try:
+        #     # corrupted_code is a torch tensor of dtype int16 representing packed words
+        #     device_pred = None
+        #     if 'error_corrector' in globals() and error_corrector is not None:
+        #         # model device
+        #         try:
+        #             device_pred = next(error_corrector.parameters()).device
+        #         except Exception:
+        #             device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #     else:
+        #         device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # Move corrupted_code to cpu numpy for normalization
-            if isinstance(corrupted_code, torch.Tensor):
-                # ensure conversion to a numpy-friendly dtype
-                corrupted_np = corrupted_code.detach().cpu().to(torch.float32).numpy().astype(np.float32)
-            else:
-                corrupted_np = np.array(corrupted_code, dtype=np.float32)
+        #     # Move corrupted_code to cpu numpy for normalization
+        #     if isinstance(corrupted_code, torch.Tensor):
+        #         # ensure conversion to a numpy-friendly dtype
+        #         corrupted_np = corrupted_code.detach().cpu().to(torch.float32).numpy().astype(np.float32)
+        #     else:
+        #         corrupted_np = np.array(corrupted_code, dtype=np.float32)
 
-            # Normalization parameters (matches notebook dataset preprocessing)
-            min_val = -32768.0
-            max_val = 32767.0
+        #     min_val = -32768.0
+        #     max_val = 32767.0
 
-            # Normalize to [0,1]
-            norm = (corrupted_np - min_val) / (max_val - min_val)
+        #     # Normalize to [0,1]
+        #     norm = (corrupted_np - min_val) / (max_val - min_val)
 
-            # Try to reshape into a [B, seq_len, 288] input for the transformer
-            total = norm.size
-            reshaped = None
-            if total == (b * t * 288):
-                reshaped = norm.reshape(b, t, 288)
-            elif total % 288 == 0:
-                seq_len = total // 288
-                reshaped = norm.reshape(1, seq_len, 288)
-            else:
-                # fallback: reshape to [b, t, f] if shapes match
-                if total == (b * t * f):
-                    reshaped = norm.reshape(b, t, f)
-                else:
-                    # As last resort, flatten to single sequence of length 288 chunks
-                    seq_len = max(1, total // 288)
-                    trimmed = norm[: seq_len * 288]
-                    reshaped = trimmed.reshape(1, seq_len, 288)
+        #     total = norm.size
+        #     reshaped = None
+        #     if total == (b * t * 288):
+        #         reshaped = norm.reshape(b, t, 288)
+        #     elif total % 288 == 0:
+        #         seq_len = total // 288
+        #         reshaped = norm.reshape(1, seq_len, 288)
+        #     else:
+        #         if total == (b * t * f):
+        #             reshaped = norm.reshape(b, t, f)
+        #         else:
+        #             seq_len = max(1, total // 288)
+        #             trimmed = norm[: seq_len * 288]
+        #             reshaped = trimmed.reshape(1, seq_len, 288)
 
-            tensor_in = torch.tensor(reshaped, dtype=torch.float32, device=device_pred)
+        #     tensor_in = torch.tensor(reshaped, dtype=torch.float32, device=device_pred)
 
-            with torch.no_grad():
-                pred_out = error_corrector(tensor_in)
+        #     with torch.no_grad():
+        #         pred_out = error_corrector(tensor_in)
 
-            # ensure predicted tensor is float32 on cpu before converting to numpy
-            pred_np = pred_out.cpu().to(torch.float32).numpy().reshape(-1)[: total]
+        #     pred_np = pred_out.cpu().to(torch.float32).numpy().reshape(-1)[: total]
 
-            # Denormalize back to int16 range
-            denorm = np.round(pred_np * (max_val - min_val) + min_val).astype(np.int16)
-
-            # Ensure same length as corrupted_np; if we trimmed earlier, pad/trim
-            if denorm.size != corrupted_np.size:
-                denorm = np.resize(denorm, corrupted_np.shape)
-
-            # Write back into corrupted_code as torch tensor of dtype int16 on original device
-            corrupted_code = torch.from_numpy(denorm).to(code.device)
-        except Exception as e:
-            # If prediction fails, fall back to using the noisy corrupted_code
-            print("Error during error-corrector prediction:", e)
-            # keep corrupted_code as-is
+        #     denorm = np.round(pred_np * (max_val - min_val)).astype(np.int16)
+        #     if denorm.size != corrupted_np.size:
+        #         denorm = np.resize(denorm, corrupted_np.shape)
+        #     corrupted_code = torch.from_numpy(denorm).to(code.device)
+        # except Exception as e:
+        #     # If prediction fails, fall back to using the noisy corrupted_code
+        #     print("Error during error-corrector prediction:", e)
+        #     # keep corrupted_code as-is
 
         # Unpack to restore shape [b, t, f]
         restored = unpack_bits(corrupted_code, [b, t, f])
-        # ensure dtype/device match original quantized tensor
-        try:
-            restored = restored.to(quantized_code.dtype).to(quantized_code.device)
-        except Exception:
-            restored = restored.to(quantized_code.device)
+        # # ensure dtype/device match original quantized tensor
+        # try:
+        #     restored = restored.to(quantized_code.dtype).to(quantized_code.device)
+        # except Exception:
+            # restored = restored.to(quantized_code.device)
 
         # assign back to `code` so callers receive the restored [b,t,f] tensor
         code = restored
-        print("Restored equals original?", torch.equal(code, quantized_code))
+        
+        # predict here using error-corrector model    ---- OLDER PORTION
+        # try:
+        #     # Load the error corrector model
+        #     device_pred = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        #     # Check if error_corrector exists globally, if not create it
+        #     global error_corrector
+        #     if 'error_corrector' not in globals() or error_corrector is None:
+        #         error_corrector = load_error_corrector(device_pred)
+                
+        #     # Convert corrupted_code (int16 packed) to binary representation for the model
+        #     # corrupted_code shape should be compatible with unpacking
+        #     flat_corrupted = corrupted_code.flatten()
+            
+        #     # Unpack each int16 to 16 bits to get binary representation
+        #     bits_per_int16 = 16
+        #     num_elements = flat_corrupted.numel()
+            
+        #     # Expand to binary: [num_elements, 16] -> [num_elements * 16]
+        #     binary_bits = ((flat_corrupted.unsqueeze(1) >> torch.arange(16, device=flat_corrupted.device)) & 1).to(torch.float32)
+        #     binary_flat = binary_bits.view(-1)  # [num_elements * 16]
+            
+        #     # Convert to [-1, 1] range for model input
+        #     binary_input = binary_flat * 2 - 1  # 0->-1, 1->1
+            
+        #     # Reshape for model: need [batch, seq_len, 4608]
+        #     # 4608 = 256 * 18, so we need to reshape accordingly
+        #     total_bits = binary_input.numel()
+        #     if total_bits % 4608 == 0:
+        #         seq_len = total_bits // 4608
+        #         model_input = binary_input[:seq_len * 4608].reshape(1, seq_len, 4608)
+        #     else:
+        #         # Pad or trim to make it divisible by 4608
+        #         target_size = ((total_bits + 4607) // 4608) * 4608
+        #         if total_bits < target_size:
+        #             # Pad with zeros
+        #             padded = torch.zeros(target_size, device=binary_input.device, dtype=binary_input.dtype)
+        #             padded[:total_bits] = binary_input
+        #             binary_input = padded
+        #         else:
+        #             # Trim
+        #             binary_input = binary_input[:target_size]
+        #         seq_len = target_size // 4608
+        #         model_input = binary_input.reshape(1, seq_len, 4608)
+            
+        #     # Move to model device
+        #     model_input = model_input.to(device_pred)
+            
+        #     # Run error correction
+        #     with torch.no_grad():
+        #         corrected_output = error_corrector(model_input)  # [1, seq_len, 4608]
+            
+        #     # Convert back to binary (0/1) from [-1, 1]
+        #     corrected_binary = (corrected_output > 0).to(torch.float32)  # [1, seq_len, 4608]
+        #     corrected_flat = corrected_binary.view(-1)  # [seq_len * 4608]
+            
+        #     # Trim to original size if we padded
+        #     if corrected_flat.numel() > total_bits:
+        #         corrected_flat = corrected_flat[:total_bits]
+            
+        #     # Repack into int16 format
+        #     # Group bits back into sets of 16
+        #     corrected_flat = corrected_flat[:num_elements * 16]  # Ensure exact size
+        #     corrected_bits = corrected_flat.view(num_elements, 16).to(torch.int16)
+            
+        #     # Pack 16 bits into int16
+        #     powers = (2 ** torch.arange(16, dtype=torch.int16, device=corrected_bits.device))
+        #     corrected_packed = (corrected_bits * powers).sum(dim=1).to(torch.int16)
+            
+        #     # Reshape back to original corrupted_code shape
+        #     corrected_code = corrected_packed.view(corrupted_code.shape).to(corrupted_code.device)
+            
+        #     # Unpack the corrected code to restore original shape
+        #     corrected_restored = unpack_bits(corrected_code, [b, t, f])
+            
+        #     # Update code with corrected version
+        #     code = corrected_restored.to(code.dtype).to(code.device)
+        #     print("=======================================================")
+        #     print(code)
+        #     print("=======================================================")
+        #     print("Error correction applied successfully")
+            
+        # except Exception as e:
+        #     print(f"Error during binary error correction: {e}")
+        #     # Fallback to using uncorrected restored code
+        #     code = restored
+        
+        # print("Restored equals original?", torch.equal(code, original_code))
 
         # code = code.to(torch.bfloat16)
         print("-" * 30)
@@ -1304,7 +1452,12 @@ class FlowMo(nn.Module):
         #     for code_vec in code_np.reshape(-1, code_np.shape[-1]):
         #         writer.writerow(code_vec)
         # ======= Aadish changes ==========
-
+        
+        old_code_flat = [int(i) for i in "1 1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 1 1 1 1 1 1 -1 -1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 -1 1 1 1 1 -1 -1 -1 1 1 1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 1 1 1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 1 -1 1 1 1 1 1 1 -1 1 1 1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 1 1 1 1 1 1 -1 1 1 1 1 -1 1 1 -1 1 1 1 1 1 1 -1 -1 1 1 1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 1 -1 -1 -1 -1 -1 1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 -1 1 -1 1 1 1 -1 -1 -1 1 1 1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 -1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 1 1 -1 1 -1 1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 -1 -1 1 1 1 -1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 1 1 1 -1 -1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 1 1 1 -1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 -1 1 1 1 -1 1 -1 1 1 1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 1 1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 1 1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 -1 1 1 -1 1 1 -1 1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 1 1 1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 1 1 1 1 1 -1 1 -1 1 -1 -1 1 1 1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 1 -1 -1 1 -1 1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 1 1 1 1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 1 -1 1 -1 -1 1 1 1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 1 -1 1 1 -1 1 1 -1 1 -1 1 1 1 1 1 1 -1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 -1 1 1 1 1 1 -1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 -1 -1 -1 1 1 1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 -1 1 1 1 1 -1 1 1 -1 -1 1 1 -1 1 1 1 -1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 -1 -1 -1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 -1 -1 1 1 -1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 1 1 1 1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 1 1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 -1 1 1 1 1 1 -1 1 -1 1 1 1 -1 -1 1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 1 1 1 1 1 1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 1 1 1 1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 1 1 1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 1 1 1 -1 1 1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 -1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 1 1 1 -1 1 -1 1 1 1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 1 1 1 1 -1 1 1 -1 1 1 -1 1 1 -1 1 1 1 -1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 -1 -1 1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 1 1 1 1 -1 1 -1 -1 1 1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 1 1 1 -1 1 1 1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 1 -1 1 1 -1 1 1 -1 -1 1 -1 1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 1 1 1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 1 -1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 1 1 -1 1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 1 -1 1 1 1 1 1 -1 -1 1 1 1 -1 -1 -1".split()]
+        old_code_flat = [int(i) for i in "1 1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 1 1 1 1 1 1 -1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 1 1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 1 1 1 -1 1 1 1 1 -1 -1 -1 1 1 1 1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 1 1 1 -1 1 -1 1 1 -1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 1 1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 1 1 1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 1 -1 1 1 1 1 1 1 -1 1 1 1 1 1 -1 -1 1 1 1 -1 -1 -1 1 1 1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 1 1 1 1 1 1 -1 1 -1 1 1 -1 1 1 -1 1 1 1 1 1 1 -1 1 1 1 1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 1 -1 -1 -1 -1 -1 1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 1 1 1 -1 1 -1 1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 1 -1 1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 -1 -1 1 -1 1 -1 -1 -1 1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 1 1 -1 1 -1 1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 1 1 -1 -1 1 1 1 -1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 -1 -1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 1 1 1 -1 -1 1 -1 1 -1 -1 1 1 1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 1 1 1 -1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 -1 1 1 1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 1 1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 1 1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 1 1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 -1 1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 -1 1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 -1 1 -1 1 -1 -1 -1 1 1 1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 -1 -1 1 1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 -1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 1 1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 1 1 1 1 1 1 1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 -1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 1 -1 1 1 -1 1 1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 1 -1 1 1 -1 1 1 -1 1 -1 1 1 1 1 1 1 -1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 1 -1 1 1 -1 -1 1 1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 1 -1 1 -1 1 -1 -1 1 1 -1 1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 1 1 1 1 -1 -1 1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 1 1 -1 1 1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 -1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 1 -1 1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 -1 -1 -1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 -1 1 1 1 1 -1 1 1 -1 -1 1 1 -1 1 1 1 -1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 -1 1 1 1 -1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 1 1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 1 -1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 1 1 1 1 1 1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 1 1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 1 -1 1 1 -1 -1 -1 1 1 1 1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 1 1 -1 1 -1 1 1 1 -1 -1 1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 1 1 -1 1 1 1 -1 1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 -1 -1 -1 1 1 1 1 1 1 -1 -1 -1 1 1 1 1 1 1 -1 1 -1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 -1 1 -1 -1 1 -1 1 1 -1 1 -1 1 1 -1 -1 1 1 -1 1 -1 1 1 -1 1 1 1 -1 1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 1 1 1 1 1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 1 -1 1 1 1 -1 -1 1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 -1 1 1 1 1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 1 1 1 1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 1 1 -1 1 -1 -1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 -1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 1 -1 1 1 1 1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 1 -1 1 1 -1 -1 -1 1 -1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 1 1 1 1 -1 1 -1 1 1 -1 -1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 -1 -1 1 1 -1 1 1 1 -1 1 1 1 1 1 1 -1 1 -1 -1 1 1 -1 -1 1 -1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 1 -1 1 1 1 -1 1 1 1 -1 -1 -1 1 -1 1 1 1 -1 -1 -1 -1 -1 1 1 -1 -1 -1 1 1 -1 -1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 1 -1 1 -1 1 -1 1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 1 1 1 1 -1 1 1 -1 1 1 -1 1 1 -1 1 1 1 -1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 1 1 -1 1 1 1 -1 -1 1 -1 1 -1 1 -1 1 1 1 -1 1 -1 1 -1 1 1 1 -1 1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 -1 1 -1 1 1 -1 -1 1 -1 1 1 1 -1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 -1 -1 1 1 1 -1 -1 1 1 1 -1 1 -1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 -1 1 1 1 -1 1 1 -1 1 -1 -1 1 1 1 -1 1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 1 -1 1 1 1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 1 1 1 -1 1 -1 -1 1 -1 1 1 -1 -1 1 -1 -1 1 -1 1 1 1 -1 1 -1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 1 -1 1 1 -1 1 -1 1 1 1 -1 1 -1 1 1 1 1 1 -1 1 1 1 1 -1 -1 1 1 -1 1 1 1 -1 1 1 -1 1 -1 1 1 -1 1 1 -1 -1 -1 1 -1 1 -1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 1 -1 -1 -1 -1 1 -1 1 1 1 1 -1 -1 -1 1 1 1 -1 -1 -1 -1 1 -1 -1 1 1 -1 -1 -1 -1 1 -1 1 -1 1 1 1 1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 -1 1 -1 -1 1 -1 -1 1 1 -1 -1 1 1 -1 -1 1 -1 -1 1 -1 -1 -1 -1 1 1 1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 1 -1 1 1 1 -1 1 -1 1 -1 -1 -1 -1 -1 -1 1 1 -1 1 -1 -1 1 1 -1 -1 1 1 1 1 -1 1 -1 1 1 -1 1 -1 -1 -1 -1 1 -1 -1 -1 1 -1 -1 1 -1 -1 1 -1 1 -1 1 -1 -1 -1 -1 1 -1 1 -1 1 -1 -1 1 -1 1 -1 -1 1 -1 -1 1 1 1 -1 1 -1 1 1 1 1 -1 1 1 -1 1 -1 -1 -1 -1 1 1 1 1 -1 -1 -1 1 -1 -1 -1 -1 -1 -1 -1 1 1 -1 1 1 1 -1 1 -1 -1 -1 -1 1 1 -1 1 -1 1 -1 1 -1 -1 -1 1 1 1 1 -1 -1 -1 -1 -1 1 1 1 -1 1 -1 -1 1 1 1 -1 1 -1 -1 1 1 1 -1 -1 -1".split()]
+        
+        old_code_tensor = torch.tensor(old_code_flat, dtype=code.dtype, device=code.device).reshape(b, t, f)
+        code = old_code_tensor  
         return code, indices, quantizer_loss
 
     def forward(

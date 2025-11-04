@@ -24,7 +24,7 @@ for i in range(1):
     reconstructed_base64 = response_json["reconstructed_image"]
 
     # 5. Decode and write the output image to disk
-    outputimagepth = f"/home/network/Documents/Semantic Communications/output_image (Chappan Output - {i}_NOISE).png"
+    outputimagepth = f"/home/network/Documents/Semantic Communications/Testing_Possibly_Good2.png"
     with open(outputimagepth, "wb") as out_file:
         out_file.write(base64.b64decode(reconstructed_base64))
 
